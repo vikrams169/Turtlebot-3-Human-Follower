@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 #################################################################################
 # Copyright 2018 ROBOTIS CO., LTD.
 #
@@ -15,123 +15,235 @@
 # limitations under the License.
 #################################################################################
 
+# Tracking and Following code on a Turtlebot 3 robot
+# Uses Kalman Filter-based linear velocity control and optimized angular velocity variation
+
+# Importing the required libraries
 import rospy
 import os
 import pickle
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+import math
 import numpy as np
 
+# Setting the rate/frequency at which the lidar sensor would take readings
+RATE = 10
+DEL_T = (1/RATE)
+TIMESTEP = 0
+
+# Setting the parameters specific to following (for the Turtlebot 3) and for the Kalman Filter
+FOLLOWING_RANGE = 0.1
+FOLLOWING_VEL = 5
+FOLLOWING_ACC = 0
+ACC_ERROR_STD_DEV = 0
+SENSOR_ERROR_MEAN = 0
+SENSOR_ERROR_STD_DEV = 0.05
+STOPPING_INERTIA_SPEED = 0.5
+
+# Setting Parameters specific to optimization of angular velocity variation and emergency stopping
+PERSON_ANGLE_OLD = 0
+INDEX_OLD = 0
+NUM_READINGS = 1
+PERSON_DISTANCE_OLD = FOLLOWING_RANGE
+CONSECUTIVE_ANGLE_THRESHOLD = 35
+STOPPING_DISTANCE_THRESHOLD = 0.005
+alpha = 1
+beta = 0.75
+gamma = 0.75
+
+# Subtracting indices in a list in a circular fashion
+def subtract_indices(index,i,total):
+    if index-i < 0:
+        return total + (index-i)
+    else:
+        return index-i
+
+# Function to add angles considering the -pi to pi range
+def add_angles(angle1,angle2):
+    answer = 0
+    answer = angle1 + angle2
+    answer = answer%360
+    if answer > 180:
+        answer = answer - 360
+    return answer
+
+# Function to subtract angles considering the -pi to pi range
+def subtract_angles(angle1,angle2):
+    answer = 0
+    answer = abs(angle1 - angle2)
+    answer = answer%360
+    if answer > 180:
+        answer = answer - 360
+    return abs(answer)
+
+# The Python class to implement the Kalman Filter
+class KF_Speed(object):
+
+    def __init__(self,dt,u,std_acc,std_meas):
+        self.dt = dt
+        self.u = u
+        self.std_acc = std_acc
+        self.A = np.matrix([[1, self.dt],
+                            [0, 1]])
+        self.B = np.matrix([[(self.dt**2)/2], [self.dt]]) 
+        self.H = np.matrix([[1,0]])
+        self.Q = np.matrix([[(self.dt**4)/4, (self.dt**3)/2],
+                            [(self.dt**3)/2, self.dt**2]]) * self.std_acc**2
+        self.R = std_meas**2
+        self.P = np.eye(self.A.shape[1])
+        self.x = np.matrix([[FOLLOWING_RANGE],[FOLLOWING_VEL]])   # Changing this from 3
+
+    def predict(self):
+        self.x = np.dot(self.A, self.x) + np.dot(self.B, self.u)
+        self.P = np.dot(np.dot(self.A, self.P), self.A.T) + self.Q
+        return self.x
+
+    def update(self, z):
+        S = np.dot(self.H, np.dot(self.P, self.H.T)) + self.R
+        K = np.dot(np.dot(self.P, self.H.T), np.linalg.inv(S))
+        self.x = np.round(self.x + np.dot(K, (z - np.dot(self.H, self.x))))
+        I = np.eye(self.H.shape[1])
+        self.P = (I-(K*self.H))*self.P 
+
+# Data preprocessing step using the sliding window method
+def filtered_range(range_values,index,window_size):
+    num_readings = len(range_values)
+    sum_readings = range_values[index]
+    for i in range(1,(window_size//2)+1):
+        sum_readings += range_values[index-i]
+    for i in range(1,(window_size//2)+1):
+        sum_readings += range_values[(index+i)%num_readings]
+    return sum_readings/num_readings
+
+# Finding the angle with of the object/human in the closest vicinity of the robot
+def find_person_index(range_values):
+    global INDEX_OLD, NUM_READINGS
+    window_size = 15
+    num_readings = len(range_values)
+    filtered_ranges = []
+    for i in range(num_readings):
+        filtered_ranges.append(filtered_range(range_values,i,window_size))
+    if TIMESTEP == 0:
+        NUM_READINGS = NUM_READINGS
+        index = np.argmin(filtered_ranges)
+        return index, filtered_ranges[index]
+    else:
+        INDEX_OLD = int(((INDEX_OLD+1)/NUM_READINGS)*num_readings)
+        NUM_READINGS = num_readings
+        min_index = INDEX_OLD%num_readings
+        for i in range(1,(window_size//2)+1):
+            if filtered_ranges[subtract_indices(INDEX_OLD,i,num_readings)] < filtered_ranges[min_index]:
+                min_index = subtract_indices(INDEX_OLD,i,num_readings)
+        for i in range(1,(window_size//2)+1):
+            if filtered_ranges[(INDEX_OLD+i)%num_readings] < filtered_ranges[min_index]:
+                min_index = (INDEX_OLD+i)%num_readings
+        INDEX_OLD = min_index
+        return min_index, filtered_ranges[min_index]
+
+# Defining the follower class
 class follower:
+
     def __init__(self):
         rospy.loginfo('Follower node initialized')
         self.config_dir = os.path.join(os.path.dirname(__file__))
         self.config_dir = self.config_dir.replace('nodes', 'config')
         self.pub = rospy.Publisher('cmd_vel', Twist, queue_size = 1)
-        self.clf = pickle.load(open(self.config_dir + '/clf', "rb"))
-        self.clf2 = pickle.load(open(self.config_dir + '/clf2', "rb"))
-        self.labels = {'30_0':0, '30_l':1, '30_r':2, '45_0':3, '45_l':4, '45_r':5,'15_0':6, 'empty':7}
-        rospy.loginfo('Tree initialized')
-        self.follow()
+        self.speed_KF =  KF_Speed(DEL_T,FOLLOWING_ACC,ACC_ERROR_STD_DEV,SENSOR_ERROR_STD_DEV)
+        rospy.loginfo('Lets start following!')
 
-    def check_people(self):
-        laser_data=[]
-        laser_data_set=[]
-        result=[]
-        ret = 0
-        self.msg = rospy.wait_for_message("scan_filtered", LaserScan)
-
-        for i in range(70,-2,-1) + range(359, 289,-1):
-
-            if   np.nan_to_num( self.msg.intensities[i] ) != 0 :
-                 laser_data.append(np.nan_to_num(self.msg.intensities[i]))
-
-            elif (i+1) in range(70,-2,-1) + range(359, 289,-1) and (i-1) in range(70,-2,-1) + range(359, 289,-1) and np.nan_to_num(self.msg.intensities[i]) == 0:
-                 laser_data.append((np.nan_to_num(self.msg.intensities[i+1])+np.nan_to_num(self.msg.intensities[i-1]))/2)
-
-            else :
-                 laser_data.append(np.nan_to_num(self.msg.intensities[i]))
-
-        laser_data_set.append(laser_data)
-
-        [x for (x , y) in self.labels.iteritems() if y == self.clf2.predict(laser_data_set) ] ## Predict the position
-
-        if result == ['empty']:
-            ret = 0
-
-        else:
-            ret = 1
-
-        return ret
-
-    def laser_scan(self):
-        data_test=[]
-        data_test_set=[]
-        self.msg = rospy.wait_for_message("scan_filtered", LaserScan)
-
-        for i in range(70,-2,-1) + range(359, 289,-1):
-
-            if   np.nan_to_num( self.msg.ranges[i] ) != 0 :
-                 data_test.append(np.nan_to_num(self.msg.ranges[i]))
-
-            elif (i+1) in range(70,-2,-1) + range(359, 289,-1) and (i-1) in range(70,-2,-1) + range(359, 289,-1) and np.nan_to_num(self.msg.ranges[i]) == 0:
-                 data_test.append((np.nan_to_num(self.msg.ranges[i+1])+np.nan_to_num(self.msg.ranges[i-1]))/2)
-
-            else :
-                 data_test.append(np.nan_to_num(self.msg.ranges[i]))
-
-        data_test_set.append(data_test)
-
-        return [x for (x , y) in self.labels.iteritems() if y == self.clf.predict(data_test_set) ] 
-
+    # The following function
     def follow(self):
-        while not rospy.is_shutdown():
-            check = self.check_people()
-            if  check == 1:
-                x = self.laser_scan()
-                twist = Twist()
-                ## Do something according to each position##
-                if  x == ['30_0']:
-                    twist.linear.x  = 0.13;      	twist.angular.z = 0.0;
-                elif x== ['30_l']:
-                    twist.linear.x  = 0.10; 		twist.angular.z = 0.4;
-                elif x== ['30_r']:
-                    twist.linear.x  = 0.10; 		twist.angular.z = -0.4;
-                elif x== ['45_0']:
-                    twist.linear.x  = 0.13;      	twist.angular.z = 0.0;
-                elif x== ['45_l']:
-                    twist.linear.x  = 0.10; 		twist.angular.z = 0.3;
-                elif x== ['45_r']:
-                    twist.linear.x  = 0.10; 		twist.angular.z = -0.3;
-                elif x== ['15_0']:
-                    twist.linear.x  = 0.0;	      	twist.angular.z = 0.0;
-                elif x== ['empty']:
-                    twist.linear.x  = 0.0;	 	    twist.angular.z = 0.0;
-                else:
-                    twist.linear.x  = 0.0;		    twist.angular.z = 0.0;
+        global TIMESTEP, PERSON_ANGLE_OLD, PERSON_DISTANCE_OLD
 
-                self.pub.publish(twist)
+        # Preprocessing the data
+        laser_data = rospy.wait_for_message("scan",LaserScan)
+        num_readings = len(laser_data.ranges)
+        range_values = np.array(laser_data.ranges)
+        person_present = True
+        twist = Twist()
+        for i in range(num_readings):
+            if range_values[i] == laser_data.range_min and i!=0 and i!=num_readings-1 and range_values[i-1] != laser_data.range_min and range_values[i+1] != laser_data.range_min:
+                range_values[i] = (range_values[i-1]+range_values[i+1])/2
+        person_index, person_distance = find_person_index(range_values)
+        
+        # Finding the angle/orientation of the nearest object/human from the robot in the -pi to pi range
+        if person_present:
+            person_angle = laser_data.angle_min + person_index*laser_data.angle_increment
+            if person_angle < 0:
+                person_angle = -((-1*person_angle)%(2*math.pi))
+            else:
+                person_angle = person_angle%(2*math.pi)
+            if person_angle > math.pi:
+                person_angle = person_angle - 2*math.pi
+            elif person_angle < -math.pi:
+                person_angle = 2*math.pi + person_angle
+            person_angle = person_angle*180/math.pi
+            print('Person Angle: ',person_angle,"   Person Distance: ",person_distance)
+            
+            # Forward linear velocity control using the Kalman Filter
+            z = self.speed_KF.H*person_distance + np.random.normal(SENSOR_ERROR_MEAN,SENSOR_ERROR_STD_DEV)
+            prediction = self.speed_KF.predict()
+            self.speed_KF.update(z.item(0))
+            robot_dist_pred = prediction[0]
+            robot_vel_pred = prediction[1]
+            robot_vel_pred += (robot_dist_pred-FOLLOWING_RANGE)*STOPPING_INERTIA_SPEED
+            if robot_vel_pred < 0:
+                twist.linear.x = 0
+            else:
+                if robot_vel_pred < 0.05:
+                    robot_vel_pred = 0.05
+                twist.linear.x = -1*robot_vel_pred
+            
+            # Optimizing angular velcity variation
+            if subtract_angles(person_angle,PERSON_ANGLE_OLD) > CONSECUTIVE_ANGLE_THRESHOLD:
+                person_angle = PERSON_ANGLE_OLD
+            person_angle_copy = person_angle
+            person_angle = add_angles((1-alpha)*PERSON_ANGLE_OLD,alpha*person_angle)
+            PERSON_ANGLE_OLD = add_angles(beta*PERSON_ANGLE_OLD,(1-beta)*person_angle_copy)
+            person_distance_stopping = PERSON_DISTANCE_OLD*gamma + person_distance*(1-gamma)
+            PERSON_DISTANCE_OLD = person_distance_stopping
+            TIMESTEP += 1
+            if person_angle > -15 and person_angle < 15:
+                twist.angular.z = 0.0;
+            elif person_angle > -30 and person_angle < -15:
+                twist.angular.z = -0.8;
+            elif person_angle > 15 and person_angle < 30:
+                twist.angular.z = 0.8;
+            elif person_angle > -60 and person_angle < -30:
+                twist.angular.z = -1.0;
+            elif person_angle > 30 and person_angle < 60:
+                twist.angular.z = 1.0;
+            elif person_angle > -90 and person_angle < -60:
+                twist.angular.z = -1.2;
+            elif person_angle > 60 and person_angle < 90:
+                twist.angular.z = 1.2;
+            elif person_angle < -90:
+                twist.angular.z = -1.4;
+            elif person_angle > 90:
+                twist.angular.z = 1.4;
 
-            elif check == 0:
-                x = self.laser_scan()
-                twist = Twist()
+            # Enabling the force stop condition in case of emergencies
+            if person_distance_stopping < STOPPING_DISTANCE_THRESHOLD or person_distance < STOPPING_DISTANCE_THRESHOLD:
+                twist.linear.x = 0
 
-                if x== ['empty']:
-                    twist.linear.x  = 0.0;		twist.angular.z = 0.0;
-
-                else:
-                    twist.linear.x  = 0.0; 		twist.angular.z = 0.4;
-
-                self.pub.publish(twist)
+            # Publishing the linear and angular velocities to the robot
+            self.pub.publish(twist)
 
 def main():
 
     rospy.init_node('follower', anonymous=True)
+    rate = rospy.Rate(RATE)
 
     try:
-        follow = follower()
+        robot = follower()
+        while not rospy.is_shutdown():
+            robot.follow()
+            rate.sleep()
     except rospy.ROSInterruptException:
-        pass    #print("Shutting down")
+        pass
 
 if __name__ == '__main__':
     main()
+
+
