@@ -1,3 +1,18 @@
+This repository enables a Turtlebot 3 burger robot to follow a human around in an obstacle-ridden environment. The package uses a Kalman Filter for linear velocity control and a weighted-average-based angular velocity variation technique. Check the 'follower' node of the package for more implementation details. This package is tested and is sure to run in ROS Noetic, but can work in other earlier ROS 1 versions too, by running the appropriate commands to SSH into the Turtlebot.<br><br>
+
+To run the package and enable the Turtlebot to start following (the human initially placed right in front of it), execute the following commands.<br><br>
+#### Terminal 1
+	[Remote PC] roscore
+#### Terminal 2
+	[Remote PC] ssh {Name of the Turtlebot}@{IP Address of the Turtlebot}	
+	[Turtlebot3] export TURTLEBOT3_MODEL=burger		
+	[Turtlebot3] roslaunch turtlebot3_bringup turtlebot3_robot.launch
+#### Terminal 3
+	[Remote PC] export TURTLEBOT3_MODEL=burger	
+	[Remote PC] roslaunch turtlebot3_follow_filter turtlebot3_follow_filter.launch
+#### Terminal 4
+	[Remote PC] roslaunch turtlebot3_follower turtlebot3_follower.launch
+	
 # TurtleBot3
 <img src="https://github.com/ROBOTIS-GIT/emanual/blob/master/assets/images/platform/turtlebot3/logo_turtlebot3.png" width="300">
 
